@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<title>PSP Web Player</title>
+<style>
+:root{--bg:#0e0f14;--fg:#eceef5;--ac:#6c8cff;--card:#1a1c26}
+*{box-sizing:border-box}html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);font-family:system-ui,sans-serif;overflow:hidden}
+#home{height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;padding:20px;text-align:center}
+#drop{width:min(520px,100%);border:2px dashed #555;border-radius:16px;padding:44px 20px;background:var(--card);cursor:pointer}
+#drop.over{border-color:var(--ac)}
+button,select,input{font:inherit}
+.btn{background:var(--ac);color:#fff;border:0;border-radius:10px;padding:10px 16px}
+.btn.alt{background:#2b2e3d}
+#game{position:fixed;inset:0;display:none}
+#fab{position:fixed;top:calc(8px + env(safe-area-inset-top));right:8px;z-index:99999;display:none;gap:6px}
+#fab button{background:#000a;color:#fff;border:1px solid #fff3;border-radius:20px;padding:8px 14px;backdrop-filter:blur(6px)}
+#panel{position:fixed;z-index:100000;inset:auto 0 0 0;max-height:75%;overflow:auto;background:var(--card);border-radius:18px 18px 0 0;padding:16px;display:none;box-shadow:0 -8px 30px #000a}
+#panel h3{margin:.2em 0 .6em}.row{display:flex;align-items:center;gap:10px;margin:10px 0}.row label{flex:0 0 110px}.row input[type=range]{flex:1}
+.cheat{background:#242736;border-radius:10px;padding:10px;margin:8px 0}
+.cheat pre{margin:6px 0 0;font-size:11px;white-space:pre-wrap;word-break:break-all;opacity:.75;max-height:70px;overflow:auto}
+.tabs{display:flex;gap:8px;margin-bottom:10px}
+small{opacity:.7}
+</style></head><body>
+<div id="home">
+  <h1>PSP Web Player</h1>
+  <div id="drop">Tap or drop your <b>PSP ISO</b> here<br><small>Saved on this device — only needed once</small></div>
+  <input type="file" id="pick" accept=".iso,.cso,.pbp" hidden>
+  <div id="msg"><small>Your game stays on your device. Nothing is uploaded.</small></div>
+  <button class="btn alt" id="forget" style="display:none">Remove saved game</button>
+</div>
+<div id="game"></div>
+<div id="fab"><button id="bCheat">Cheats</button><button id="bSet">⚙ Touch</button></div>
+<div id="panel"></div>
+
+<script>
+const $=id=>document.getElementById(id), KEY='game.iso', S={opacity:.7,size:1,res:'960x544'};
+try{Object.assign(S,JSON.parse(localStorage.getItem('pspset')||'{}'))}catch{}
+let gameId=null, cheats=[];
+
+/* ---------- storage (OPFS) ---------- */
+const root=()=>navigator.storage.getDirectory();
+async function save(f){const h=await (await root()).getFileHandle(KEY,{create:true});const w=await h.createWritable();await f.stream().pipeTo(w);return h.getFile()}
+async function load(){try{return await (await (await root()).getFileHandle(KEY)).getFile()}catch{return null}}
+
+/* ---------- ISO -> game ID (reads PARAM.SFO) ---------- */
+const rd=async(f,o,l)=>new Uint8Array(await f.slice(o,o+l).arrayBuffer());
+async function find(f,lba,size,name){
+  const d=await rd(f,lba*2048,size);let p=0;
+  while(p<size){const l=d[p];if(!l){p=(Math.floor(p/2048)+1)*2048;continue}
+    const n=new TextDecoder().decode(d.subarray(p+33,p+33+d[p+32])).replace(/;1$/,'');
+    if(n===name){const v=new DataView(d.buffer,d.byteOffset+p);return{lba:v.getUint32(2,true),size:v.getUint32(10,true)}}
+    p+=l}return null}
+async function discId(f){
+  try{const pvd=await rd(f,16*2048,2048),v=new DataView(pvd.buffer);
+    let d=await find(f,v.getUint32(158,true),v.getUint32(166,true),'PSP_GAME');if(!d)return null;
+    let s=await find(f,d.lba,d.size,'PARAM.SFO');if(!s)return null;
+    const b=await rd(f,s.lba*2048,s.size),dv=new DataView(b.buffer),kt=dv.getUint32(8,true),dt=dv.getUint32(12,true),n=dv.getUint32(16,true),T=new TextDecoder();
+    for(let i=0;i<n;i++){const e=20+i*16,ko=kt+dv.getUint16(e,true);let k='';for(let j=ko;b[j];j++)k+=String.fromCharCode(b[j]);
+      if(k==='DISC_ID'){const o=dt+dv.getUint32(e+12,true);const id=T.decode(b.subarray(o,o+9));return id.slice(0,4)+'-'+id.slice(4)}}
+  }catch(e){}return null}
+
+/* ---------- cheat.db ---------- */
+let dbText=null;
+async function getDb(){if(dbText)return dbText;try{dbText=await (await fetch('cheat.db')).text()}catch{}return dbText}
+async function loadCheats(id){
+  const db=await getDb();if(!db||!id)return[];
+  const a=db.indexOf('_S '+id);if(a<0)return[];
+  let b=db.indexOf('\n_S ',a+5);if(b<0)b=db.length;
+  const out=[];let cur=null;
+  for(const line of db.slice(a,b).split(/\r?\n/)){
+    if(line.startsWith('_C')){cur={name:line.slice(4).trim(),on:line[2]==='1',lines:[]};out.push(cur)}
+    else if(line.startsWith('_L')&&cur)cur.lines.push(line.trim())}
+  return out}
+
+/* ---------- start ---------- */
+async function start(file){
+  $('home').remove();$('game').style.display='block';$('fab').style.display='flex';
+  gameId=await discId(file);cheats=await loadCheats(gameId);
+  Object.assign(window,{EJS_player:'#game',EJS_core:'psp',EJS_gameName:gameId||'PSP Game',
+    EJS_gameUrl:URL.createObjectURL(file),EJS_pathtodata:'https://cdn.emulatorjs.org/stable/data/',
+    EJS_startOnLoaded:true,EJS_color:'#6c8cff',
+    EJS_defaultOptions:{'ppsspp_internal_resolution':S.res},
+    EJS_cheats:cheats.map(c=>[c.name,c.lines.join('\n')])});
+  const s=document.createElement('script');s.src=EJS_pathtodata+'loader.js';document.body.appendChild(s);
+  applyTouch();
+}
+
+/* ---------- touch styling ---------- */
+function applyTouch(){
+  let st=$('tstyle');if(!st){st=document.createElement('style');st.id='tstyle';document.head.appendChild(st)}
+  st.textContent=`.ejs_virtualGamepad_parent{opacity:${S.opacity}!important;transform:scale(${S.size});transform-origin:bottom center}`;
+  localStorage.setItem('pspset',JSON.stringify(S))}
+
+/* ---------- panels ---------- */
+const P=$('panel');
+$('bSet').onclick=()=>{
+  P.innerHTML=`<h3>Touch controls</h3>
+  <div class="row"><label>Opacity</label><input type="range" min="0.1" max="1" step="0.05" value="${S.opacity}" id="o"></div>
+  <div class="row"><label>Size</label><input type="range" min="0.6" max="1.6" step="0.05" value="${S.size}" id="z"></div>
+  <div class="row"><label>Resolution</label><select id="r"><option value="480x272">1x (480×272)</option><option value="960x544">2x (960×544)</option><option value="1440x816">3x (1440×816)</option></select></div>
+  <small>Resolution applies after reload. For full button remapping/repositioning, open the ⚙ settings inside the emulator menu (Control Settings).</small>
+  <div class="row"><button class="btn" id="x">Done</button></div>`;
+  P.style.display='block';$('r').value=S.res;
+  $('o').oninput=e=>{S.opacity=+e.target.value;applyTouch()};
+  $('z').oninput=e=>{S.size=+e.target.value;applyTouch()};
+  $('r').onchange=e=>{S.res=e.target.value;applyTouch();if(window.EJS_emulator)try{EJS_emulator.changeSettingOption('ppsspp_internal_resolution',S.res)}catch{}};
+  $('x').onclick=()=>P.style.display='none'};
+$('bCheat').onclick=()=>{
+  P.innerHTML=`<h3>Cheats ${gameId?'· '+gameId:''}</h3>`+(cheats.length?
+    `<input id="q" placeholder="Search cheats…" style="width:100%;padding:10px;border-radius:10px;border:0;margin-bottom:8px"><div id="cl"></div>`
+    :`<p>${gameId?'No cheats found for '+gameId+'.':'Couldn’t read the game ID (CSO/PBP not supported).'}</p>`)+`<button class="btn" id="x">Close</button>`;
+  P.style.display='block';$('x').onclick=()=>P.style.display='none';
+  const draw=q=>{$('cl').innerHTML=cheats.filter(c=>c.name.toLowerCase().includes(q)).map(c=>`<div class="cheat"><b>${c.name.replace(/</g,'&lt;')}</b><pre>${c.lines.join('\n')}</pre><button class="btn alt" onclick="navigator.clipboard.writeText(decodeURIComponent('${encodeURIComponent(c.lines.join('\n'))}'))">Copy</button></div>`).join('')};
+  if(cheats.length){draw('');$('q').oninput=e=>draw(e.target.value.toLowerCase())}};
+
+/* ---------- drop / pick ---------- */
+const pick=$('pick'),drop=$('drop');
+const go=async f=>{if(!f)return;drop.textContent='Saving… (large files take a moment)';try{start(await save(f))}catch{start(f)}};
+drop.onclick=()=>pick.click();pick.onchange=()=>go(pick.files[0]);
+drop.ondragover=e=>{e.preventDefault();drop.classList.add('over')};drop.ondragleave=()=>drop.classList.remove('over');
+drop.ondrop=e=>{e.preventDefault();go(e.dataTransfer.files[0])};
+$('forget').onclick=async()=>{await (await root()).removeEntry(KEY);location.reload()};
+load().then(f=>{if(f)$('forget').style.display='block',drop.innerHTML='Saved game found<br><small>Starting…</small>',start(f)});
+</script></body></html>
